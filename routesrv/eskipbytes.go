@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +56,6 @@ type eskipBytes struct {
 	mu               sync.RWMutex
 	hash             string
 	zoneHash         map[string]string
-	zoneMapHash      string
 	lastModified     time.Time
 	zoneLastModified map[string]time.Time
 	initialized      bool
@@ -73,43 +71,45 @@ type eskipBytes struct {
 	now     func() time.Time
 }
 
-// computeZoneMapHash returns a deterministic hash over the zone-aware routing
-// table. An empty or nil map returns an empty string. Zones are sorted before
-// hashing to guarantee stability regardless of map iteration order.
-func computeZoneMapHash(zoneAwareRoutes map[string][]*eskip.Route) string {
-	if len(zoneAwareRoutes) == 0 {
-		return ""
+// zoneHashesEqual reports whether two zone->hash maps are identical,
+// covering added, removed, and changed zones.
+func zoneHashesEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	zones := make([]string, 0, len(zoneAwareRoutes))
-	for z := range zoneAwareRoutes {
-		zones = append(zones, z)
+	for zone, h := range a {
+		if b[zone] != h {
+			return false
+		}
 	}
-	sort.Strings(zones)
-
-	h := sha256.New()
-	buf := &bytes.Buffer{}
-	for _, z := range zones {
-		buf.Reset()
-		eskip.Fprint(buf, eskip.PrettyPrintInfo{Pretty: false, IndentStr: ""}, zoneAwareRoutes[z]...)
-		h.Write([]byte(z))
-		h.Write(buf.Bytes())
-	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return true
 }
 
 // formatAndSet takes a slice of routes and stores them eskip-formatted
 // in a synchronized way. It returns the length of the stored data, and
 // flags signaling whether the data was initialized and updated.
-// An update is triggered when either the global routes hash or the zone
-// map hash differs from the previously stored value, so a change in zone
-// topology alone (without route changes) is detected independently.
+// An update is triggered when either the global routes hash or any
+// per-zone route hash differs from the previously stored value, so a
+// change in zone topology alone (without route changes) is detected
+// independently.
 func (e *eskipBytes) formatAndSet(routes []*eskip.Route, zoneAwareRoutes map[string][]*eskip.Route) (_ int, _ string, initialized bool, updated bool) {
 
 	buf := &bytes.Buffer{}
 	eskip.Fprint(buf, eskip.PrettyPrintInfo{Pretty: false, IndentStr: ""}, routes...)
 	data := buf.Bytes()
 
-	newZoneMapHash := computeZoneMapHash(zoneAwareRoutes)
+	// Format and hash every zone exactly once. newZoneData is reused below
+	// to populate zoneDataCompressed when zoneUpdated, instead of
+	// re-serializing each zone a second time.
+	newZoneHash := make(map[string]string, len(zoneAwareRoutes))
+	newZoneData := make(map[string][]byte, len(zoneAwareRoutes))
+	for zone, zoneRoutes := range zoneAwareRoutes {
+		zoneBuf := &bytes.Buffer{}
+		eskip.Fprint(zoneBuf, eskip.PrettyPrintInfo{Pretty: false, IndentStr: ""}, zoneRoutes...)
+		zoneData := zoneBuf.Bytes()
+		newZoneData[zone] = zoneData
+		newZoneHash[zone] = fmt.Sprintf("%x", sha256.Sum256(zoneData))
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -126,23 +126,18 @@ func (e *eskipBytes) formatAndSet(routes []*eskip.Route, zoneAwareRoutes map[str
 		e.zdata = e.compressLocked(data)
 	}
 
-	zoneUpdated := newZoneMapHash != e.zoneMapHash
+	zoneUpdated := !zoneHashesEqual(newZoneHash, e.zoneHash)
 
 	if zoneUpdated {
 		e.zoneDataCompressed, e.zoneCount = make(map[string][]byte), make(map[string]int)
-		e.zoneHash = make(map[string]string)
+		e.zoneHash = newZoneHash
 		e.zoneLastModified = make(map[string]time.Time)
 		for zone, routes := range zoneAwareRoutes {
-			zoneBuf := &bytes.Buffer{}
-			eskip.Fprint(zoneBuf, eskip.PrettyPrintInfo{Pretty: false, IndentStr: ""}, routes...)
-			zoneData := zoneBuf.Bytes()
+			zoneData := newZoneData[zone]
 			e.zoneLastModified[zone] = now
 			e.zoneDataCompressed[zone] = e.compressLocked(zoneData)
-			e.zoneHash[zone] = fmt.Sprintf("%x", sha256.Sum256(zoneData))
 			e.zoneCount[zone] = len(routes)
 		}
-		e.zoneMapHash = newZoneMapHash
-
 	}
 
 	initialized = !e.initialized
